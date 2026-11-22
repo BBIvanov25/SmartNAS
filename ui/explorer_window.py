@@ -7,8 +7,6 @@ from core.chunker import SmartTransferEngine
 from core.thumbnails import create_tk_preview
 from storage.ftp_backend import FTPStorageBackend
 from storage.folder_backend import FolderStorageBackend
-from storage.demo_backend import DemoHTTPBackend
-from simulator.weak_router import start_router_in_background
 from core.win_icons import get_windows_icon_ppm, get_windows_folder_icon_ppm
 
 # Minimalist Obsidian Palette
@@ -59,11 +57,19 @@ class SmartNASExplorer(tk.Tk):
 
         self.source_buttons: dict[str, tuple[tk.Frame, tk.Button, tk.Label]] = {}
         self.filter_buttons: dict[str, tk.Button] = {}
+        self.sort_key = "name"
+        self.sort_reverse = False
 
         self._style()
         self._build_layout()
         self._sync_sidebar_states()
         self._clear_details()
+        self.bind("<Control-f>", lambda _e: self._focus_search())
+        self.bind("<Control-u>", lambda _e: self.upload_dialog())
+        self.bind("<F5>", lambda _e: self.refresh_files())
+        self.bind("<Escape>", lambda _e: self._clear_search())
+        self.bind("<Alt-Up>", lambda _e: self._go_up())
+        self.bind("<Delete>", lambda _e: self.delete_selected())
         self.after(200, self.refresh_files)
 
     def _style(self):
@@ -254,7 +260,6 @@ class SmartNASExplorer(tk.Tk):
         for label, mode_val, proto in [
             ("Local folder", "FOLDER", "LOCAL"),
             ("Router (FTP)", "FTP", "FTP"),
-            ("Demo router", "DEMO", "SMB"),
         ]:
             row = tk.Frame(sidebar, bg=BG_PANEL)
             row.pack(fill="x", pady=1)
@@ -331,6 +336,8 @@ class SmartNASExplorer(tk.Tk):
         search_entry.pack(side="right")
         search_entry.bind("<KeyRelease>", lambda _e: self._render_grid())
         ttk.Label(list_bar, text="Search", foreground=TEXT_MUTED).pack(side="right", padx=(12, 6))
+        ttk.Button(list_bar, text="×", width=2, command=self._clear_search).pack(side="right", padx=(4, 0))
+        self.search_entry = search_entry
 
         chunk_box = ttk.Combobox(list_bar, values=["512 KB", "1024 KB", "2048 KB"], width=9, state="readonly")
         chunk_box.current(1)
@@ -347,14 +354,14 @@ class SmartNASExplorer(tk.Tk):
         self.file_tree = ttk.Treeview(
             table_frame, columns=columns, show=("tree", "headings"), selectmode="browse"
         )
-        self.file_tree.heading("#0", text="Name", anchor="w")
+        self.file_tree.heading("#0", text="Name", anchor="w", command=lambda: self._sort_grid("name"))
         self.file_tree.column("#0", width=340, anchor="w", stretch=True)
         for col, title, width, anchor in [
             ("type", "Type", 90, "w"),
             ("parts", "Parts", 110, "e"),
             ("size", "Size", 95, "e"),
         ]:
-            self.file_tree.heading(col, text=title, anchor=anchor)
+            self.file_tree.heading(col, text=title, anchor=anchor, command=lambda c=col: self._sort_grid(c))
             self.file_tree.column(col, width=width, anchor=anchor)
 
         self.file_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
@@ -412,6 +419,12 @@ class SmartNASExplorer(tk.Tk):
             value.pack(side="left", fill="x", expand=True)
             self.detail_rows[key] = value
             self.detail_row_widgets[key] = row
+        ttk.Button(
+            self.detail_row_widgets["sha256"],
+            text="Copy",
+            width=6,
+            command=lambda: self._copy_sha256(),
+        ).pack(side="right")
 
         self.archive_label = ttk.Label(details, text="Archive contents", style="Muted.TLabel")
         self.archive_label.pack(anchor="w", pady=(10, 4))
@@ -473,6 +486,23 @@ class SmartNASExplorer(tk.Tk):
         self._sync_sidebar_states()
         self._render_grid()
 
+    def _focus_search(self):
+        self.search_entry.focus_set()
+        self.search_entry.selection_range(0, tk.END)
+
+    def _clear_search(self):
+        self.search_var.set("")
+        self._render_grid()
+        if hasattr(self, "search_entry"):
+            self.search_entry.focus_set()
+
+    def _copy_sha256(self):
+        if not self.selected_manifest:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(self.selected_manifest.total_sha256)
+        self.status_lbl.configure(text="SHA-256 copied to clipboard.")
+
     def _update_address_bar(self):
         m = self.mode.get()
         sub = f"{self.current_subpath}/" if self.current_subpath else ""
@@ -481,9 +511,9 @@ class SmartNASExplorer(tk.Tk):
             prefix = f"{base}/" if base else ""
             self.address_var.set(f"ftp://{self.ftp_host.get()}:{self.ftp_port.get()}/{prefix}{sub}")
         elif m == "FOLDER":
-            self.address_var.set(f"smb://router_usb_disk/{sub}")
+            self.address_var.set(f"{os.path.abspath(self.local_dir.get())}\\{sub}" if sub else os.path.abspath(self.local_dir.get()))
         else:
-            self.address_var.set(f"router://127.0.0.1:8001/USB_Disk/{sub}")
+            self.address_var.set(sub)
         self.btn_up.configure(state="normal" if self.current_subpath else "disabled")
 
     def _get_backend(self):
@@ -494,14 +524,12 @@ class SmartNASExplorer(tk.Tk):
             )
         if m == "FOLDER":
             return FolderStorageBackend(self.local_dir.get())
-        return DemoHTTPBackend("http://127.0.0.1:8001")
+        raise ValueError("Unknown storage location")
 
     def user_val(self) -> str:
         return self.ftp_user.get().strip() or "anonymous"
 
     def _switch_source(self, mode_val: str):
-        if mode_val == "DEMO":
-            start_router_in_background(8001)
         self.mode.set(mode_val)
         self.current_subpath = ""
         self._sync_sidebar_states()
@@ -524,7 +552,7 @@ class SmartNASExplorer(tk.Tk):
     def open_connection_dialog(self):
         win = tk.Toplevel(self)
         win.title("Connection settings")
-        win.geometry("430x340")
+        win.geometry("470x390")
         win.resizable(False, False)
         win.configure(bg=BG_PANEL)
         win.transient(self)
@@ -557,7 +585,18 @@ class SmartNASExplorer(tk.Tk):
         ttk.Entry(wrap, textvariable=self.ftp_base, font=("Consolas", 9)).pack(fill="x", pady=(0, 10))
 
         ttk.Label(wrap, text="Network or local folder", style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
-        ttk.Entry(wrap, textvariable=self.local_dir, font=("Consolas", 9)).pack(fill="x", pady=(0, 16))
+        local_row = ttk.Frame(wrap, style="Panel.TFrame")
+        local_row.pack(fill="x", pady=(0, 16))
+        ttk.Entry(local_row, textvariable=self.local_dir, font=("Consolas", 9)).pack(
+            side="left", fill="x", expand=True, padx=(0, 8)
+        )
+
+        def browse_local():
+            selected = filedialog.askdirectory(title="Choose local storage folder", initialdir=self.local_dir.get())
+            if selected:
+                self.local_dir.set(selected)
+
+        ttk.Button(local_row, text="Browse", command=browse_local).pack(side="right")
 
         def save_and_reload():
             self.current_subpath = ""
@@ -567,10 +606,34 @@ class SmartNASExplorer(tk.Tk):
 
         actions = ttk.Frame(wrap, style="Panel.TFrame")
         actions.pack(fill="x", side="bottom")
+        if self.mode.get() == "FTP":
+            ttk.Button(
+                actions,
+                text="Test connection",
+                command=lambda: self._test_ftp_connection(actions),
+            ).pack(side="left")
         ttk.Button(actions, text="Save and refresh", style="Accent.TButton", command=save_and_reload).pack(
             side="right"
         )
         ttk.Button(actions, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 8))
+
+    def _test_ftp_connection(self, parent):
+        def worker():
+            try:
+                backend = FTPStorageBackend(
+                    self.ftp_host.get(),
+                    int(self.ftp_port.get()),
+                    self.user_val(),
+                    self.ftp_pass.get(),
+                    self.ftp_base.get(),
+                )
+                backend.list_items("")
+                self.after(0, lambda: messagebox.showinfo("Connection successful", "The FTP server is reachable."))
+            except Exception as e:
+                err_msg = str(e)
+                self.after(0, lambda msg=err_msg: messagebox.showerror("Connection failed", msg))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def refresh_files(self):
         self.status_lbl.configure(text="Loading folders and files...")
@@ -616,6 +679,16 @@ class SmartNASExplorer(tk.Tk):
             if (cat == "all" or m.category == cat) and (query in m.original_filename.lower())
         ]
 
+        if self.sort_key == "name":
+            visible_folders.sort(key=str.lower, reverse=self.sort_reverse)
+            filtered_files.sort(key=lambda m: m.original_filename.lower(), reverse=self.sort_reverse)
+        elif self.sort_key == "type":
+            filtered_files.sort(key=lambda m: m.category, reverse=self.sort_reverse)
+        elif self.sort_key == "parts":
+            filtered_files.sort(key=lambda m: len(m.chunks), reverse=self.sort_reverse)
+        elif self.sort_key == "size":
+            filtered_files.sort(key=lambda m: m.total_size, reverse=self.sort_reverse)
+
         for folder_name in visible_folders:
             iid = f"folder:{folder_name}"
             self.item_map[iid] = ("folder", folder_name)
@@ -643,6 +716,14 @@ class SmartNASExplorer(tk.Tk):
 
         total_mb = sum(m.total_size for m in self.manifests) / (1024 * 1024)
         self.sidebar_storage.configure(text=f"{len(self.manifests)} protected files · {total_mb:.2f} MB")
+
+    def _sort_grid(self, key: str):
+        if self.sort_key == key:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_key = key
+            self.sort_reverse = False
+        self._render_grid()
 
     def _tree_icon(self, folder: bool = False, extension: str = "") -> tk.PhotoImage | None:
         if folder:
